@@ -1,20 +1,6 @@
 """
 utils.py — helpers for CTC forced alignment with the omnilingual sherpa-onnx model.
-
-Key design decisions (learned from model.py / the reference demo):
-  - Audio is loaded via the wave module (16-bit PCM, mono) exactly as the
-    reference does in read_wave(), then normalised to [-1, 1].
-  - The recogniser is built with
-        sherpa_onnx.OfflineRecognizer.from_omnilingual_asr_ctc()
-    which handles all internal feature-extraction; we must NOT feed raw
-    audio directly into the ONNX session naively.
-  - Tokens file format:  "<token> <integer-id>"  (space-separated).
-  - Tokens are subword units (e.g. "▁THE", "ING", "ATION") — text must be
-    matched against them greedily, not character-by-character.
-  - torchaudio.functional.forced_align() expects log-probs (shape B,T,C);
-    we log-softmax the raw logits before passing them.
 """
-
 import re
 import wave
 from pathlib import Path
@@ -26,20 +12,14 @@ import torchaudio
 
 
 # ---------------------------------------------------------------------------
-# Audio loading — mirrors read_wave() in the reference model.py
+# Audio loading
 # ---------------------------------------------------------------------------
 
 def load_audio(file_path: str, target_sr: int = 16000) -> Tuple[np.ndarray, int]:
     """
     Load a WAV file and return (samples_float32, sample_rate).
-
-    Accepts mono 16-bit PCM natively.  Falls back to torchaudio for other
-    formats (stereo, non-16kHz, mp3, flac, etc.).
-
-    Returns
-    -------
-    samples : np.ndarray  shape (N,)  dtype float32  range [-1, 1]
-    sample_rate : int  (always target_sr after resampling)
+    Accepts mono 16-bit PCM natively, falls back to torchaudio.
+    Returns samples in range [-1, 1].
     """
     path = str(file_path)
     try:
@@ -75,17 +55,7 @@ def _resample_np(samples: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarra
 
 def read_tokens(tokens_path: str) -> Tuple[Dict[str, int], Dict[int, str]]:
     """
-    Parse tokens.txt with format:  <token> <integer-id>
-
-    Example lines:
-        <blk> 0
-        <sos/eos> 1
-        S 3
-        ▁THE 5
-        ING 14
-
-    Special tokens like '<blk>', '<sos/eos>', '<unk>' are included so that
-    id2token is complete for building char intervals.
+    Parse tokens.txt with format: <token> <integer-id>
     """
     token2id: Dict[str, int] = {}
     id2token: Dict[int, str] = {}
@@ -95,8 +65,7 @@ def read_tokens(tokens_path: str) -> Tuple[Dict[str, int], Dict[int, str]]:
             line = line.rstrip("\n")
             if not line:
                 continue
-            # Split on the LAST space to handle any token containing spaces
-            parts = line.rsplit(" ", 1)
+            parts = line.rsplit(" ", 1)  # token may contain spaces, so split from right
             if len(parts) != 2:
                 continue
             token, id_str = parts
@@ -111,58 +80,31 @@ def read_tokens(tokens_path: str) -> Tuple[Dict[str, int], Dict[int, str]]:
 
 
 # ---------------------------------------------------------------------------
-# Text → token IDs  (subword greedy matching)
+# Text → token IDs (CHARACTER‑LEVEL mapping)
 # ---------------------------------------------------------------------------
 
 def text_to_token_ids(text: str, token2id: Dict[str, int]) -> List[int]:
     """
-    Convert *text* to a list of token IDs using greedy longest-match against
-    the subword vocabulary.
+    Convert text to CTC token IDs character by character.
+    The model vocabulary is expected to contain single characters
+    (lowercase Latin letters, digits, Twi-specific letters like ɛ, ɔ, etc.).
 
-    The tokens use SentencePiece '▁' to mark word-initial subwords.
-    Steps:
-      1. Upper-case the text (tokens are upper-case in this vocabulary).
-      2. At each word boundary, prefer tokens with '▁' prefix.
-      3. Greedily scan for the longest matching token.
-
-    Characters/substrings with no matching token are skipped with a warning.
+    Spaces are skipped – CTC blank will separate words automatically.
+    Any character not found in token2id is skipped with a warning.
     """
-    text_up = text.upper()
-    ids: List[int] = []
-    i = 0
-    n = len(text_up)
-    at_word_start = True
-
-    while i < n:
-        ch = text_up[i]
+    ids = []
+    for ch in text:
         if ch == " ":
-            at_word_start = True
-            i += 1
             continue
-
-        matched = False
-        # Try with ▁ prefix first (at word boundary), then without
-        prefixes = ["▁"] if at_word_start else []
-        prefixes.append("")
-
-        for prefix in prefixes:
-            # Longest-match: try from the max possible length down to 1
-            for end in range(min(i + 30, n), i, -1):
-                candidate = prefix + text_up[i:end]
-                if candidate in token2id:
-                    ids.append(token2id[candidate])
-                    i = end
-                    at_word_start = False
-                    matched = True
-                    break
-            if matched:
-                break
-
-        if not matched:
-            print(f"Warning: no token for '{text_up[i]}' at position {i}, skipping")
-            i += 1
-            at_word_start = False
-
+        if ch in token2id:
+            ids.append(token2id[ch])
+        else:
+            # Try lowercase/uppercase variants only if needed (optional)
+            alt = ch.lower() if ch.isupper() else ch.upper()
+            if alt in token2id:
+                ids.append(token2id[alt])
+            else:
+                print(f"Warning: no token for {ch!r}, skipping")
     return ids
 
 
@@ -176,39 +118,22 @@ def get_emissions_via_sherpa(
     sample_rate: int = 16000,
 ) -> torch.Tensor:
     """
-    Use the sherpa-onnx recogniser to decode the audio, then re-run the raw
-    ONNX encoder to obtain log-probability emissions for forced alignment.
-
-    The recogniser's internal config exposes the ONNX model path, which we
-    use to run onnxruntime directly.
-
-    Returns
-    -------
-    log_probs : torch.Tensor  shape (T, vocab_size)
+    Use the sherpa-onnx recogniser to decode and then extract raw emissions.
     """
-    # Sanity-check decode via the full sherpa pipeline
     stream = recognizer.create_stream()
     stream.accept_waveform(sample_rate, samples)
     recognizer.decode_stream(stream)
     hypothesis = stream.result.text
     print(f"Sherpa transcription (sanity check): {hypothesis!r}")
 
-    # Locate the ONNX model file from the recogniser config
     model_path = _find_model_path(recognizer)
     if not model_path:
-        raise RuntimeError(
-            "Could not determine the ONNX model path from the recogniser config. "
-            "Pass model_path explicitly to get_emissions_direct() instead."
-        )
-
+        raise RuntimeError("Could not find ONNX model path from recogniser config.")
     return get_emissions_direct(model_path, samples, sample_rate)
 
 
 def _find_model_path(recognizer) -> str:
-    """
-    Attempt to extract the ONNX model file path from the recogniser config.
-    The sherpa-onnx config tree varies by model family; we try common paths.
-    """
+    """Extract the ONNX model path from the sherpa recogniser config."""
     try:
         mf = recognizer.config.model_config.offline_model_config.model_files
         for attr in ("model", "nemo_ctc", "wenet_ctc", "tdnn", "zipformer2_ctc"):
@@ -225,26 +150,14 @@ def get_emissions_direct(
     samples: np.ndarray,
     sample_rate: int = 16000,
 ) -> torch.Tensor:
-    """
-    Run the ONNX encoder directly via onnxruntime and return log-probs.
-
-    The omnilingual model expects raw float32 audio as its single input
-    (shape 1 x N_samples).  This matches the pattern used in the reference
-    decode path before sherpa's feature-extraction front-end was added.
-
-    Returns
-    -------
-    log_probs : torch.Tensor  shape (T, vocab_size)
-    """
+    """Run the ONNX encoder directly and return log-probabilities (T, vocab)."""
     import onnxruntime as ort
 
     opts = ort.SessionOptions()
     opts.inter_op_num_threads = 2
     opts.intra_op_num_threads = 2
 
-    sess = ort.InferenceSession(
-        model_path, sess_options=opts, providers=["CPUExecutionProvider"]
-    )
+    sess = ort.InferenceSession(model_path, sess_options=opts, providers=["CPUExecutionProvider"])
 
     audio_in = np.expand_dims(samples, axis=0).astype(np.float32)  # (1, N)
     input_name = sess.get_inputs()[0].name
@@ -252,11 +165,9 @@ def get_emissions_direct(
 
     logits = outputs[0]
     if logits.ndim == 3:
-        logits = logits[0]  # (1, T, vocab) → (T, vocab)
+        logits = logits[0]  # (1, T, vocab) -> (T, vocab)
 
-    log_probs = torch.log_softmax(
-        torch.tensor(logits, dtype=torch.float32), dim=-1
-    )
+    log_probs = torch.log_softmax(torch.tensor(logits, dtype=torch.float32), dim=-1)
     return log_probs
 
 
@@ -267,24 +178,12 @@ def get_emissions_direct(
 def forced_align_emissions(
     log_probs: torch.Tensor,
     target_ids: List[int],
-    blank_id: int = 0,
+    blank_id: int = 0,   # typically <s> or <blk> — check your tokens.txt, often 0
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Wrapper around torchaudio.functional.forced_align().
-
-    Parameters
-    ----------
-    log_probs  : (T, vocab)  log-probabilities
-    target_ids : list[int]   subword token IDs to align
-    blank_id   : CTC blank index (0 for this model)
-
-    Returns
-    -------
-    alignment : (T,) int tensor — token id per frame (blank between tokens)
-    scores    : (T,) float tensor — per-frame alignment scores
     """
     target = torch.tensor(target_ids, dtype=torch.int32)
-    # forced_align expects (B, T, C) and (B, S)
     with torch.no_grad():
         alignment, scores = torchaudio.functional.forced_align(
             log_probs.unsqueeze(0),
@@ -305,11 +204,7 @@ def build_char_intervals(
     frame_period: float,
     blank_id: int = 0,
 ) -> List[dict]:
-    """
-    Convert frame-level alignment to subword-token intervals.
-
-    Each entry: {"token": str, "start": float, "end": float, "score": float}
-    """
+    """Convert frame-level alignment to token intervals."""
     intervals = []
     prev_id = -1
     cur_start = 0.0
@@ -322,10 +217,8 @@ def build_char_intervals(
         if token_id == blank_id:
             prev_id = token_id
             continue
-
         if token_id != prev_id:
             cur_start = i * frame_period
-
         next_id = aln[i + 1] if i + 1 < n else -1
         if next_id != token_id:
             intervals.append({
@@ -334,49 +227,39 @@ def build_char_intervals(
                 "end": round((i + 1) * frame_period, 4),
                 "score": round(scr[i], 4),
             })
-
         prev_id = token_id
 
     return intervals
 
 
 def merge_to_words(token_intervals: List[dict], transcript: str) -> List[dict]:
-    """
-    Merge subword-token intervals into word intervals.
-
-    Tokens prefixed with '▁' mark the start of a new word.
-    """
+    """Merge token intervals into word intervals using spaces in transcript."""
     if not token_intervals:
         return []
-
-    orig_words = transcript.split()
-    word_groups: List[List[dict]] = []
-    current: List[dict] = []
-
-    for tok in token_intervals:
-        if tok["token"].startswith("▁") and current:
-            word_groups.append(current)
-            current = [tok]
-        else:
-            current.append(tok)
-    if current:
-        word_groups.append(current)
-
+    words = transcript.split()
+    # Simple grouping: each token corresponds to one character;
+    # we need to group back into words by re-joining characters.
+    # However, since our tokenization removes spaces, we've lost the boundaries.
+    # Better to use the original transcript word lengths to re-group.
+    char_tokens = [t["token"] for t in token_intervals]
+    full_str = "".join(char_tokens)
     result = []
-    for idx, group in enumerate(word_groups):
-        word_text = orig_words[idx] if idx < len(orig_words) else (
-            "".join(t["token"].lstrip("▁") for t in group)
-        )
-        result.append({
-            "word": word_text,
-            "start": group[0]["start"],
-            "end": group[-1]["end"],
-        })
+    pos = 0
+    for word in words:
+        word_len = len(word)
+        chunk = token_intervals[pos:pos + word_len]
+        if chunk:
+            result.append({
+                "word": word,
+                "start": chunk[0]["start"],
+                "end": chunk[-1]["end"],
+            })
+        pos += word_len
     return result
 
 
 def merge_words_into_sentences(word_intervals: List[dict], transcript: str) -> List[dict]:
-    """Group word intervals into sentences delimited by .!? punctuation."""
+    """Group word intervals into sentences (split on .!?)."""
     sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', transcript.strip()) if s.strip()]
     result = []
     word_idx = 0
