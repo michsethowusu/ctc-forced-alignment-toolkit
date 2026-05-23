@@ -1,5 +1,20 @@
-torch
-torchaudio
+# Core dependencies for CTC forced alignment
+# Torch ecosystem
+torch>=1.13
+torchaudio>=0.13
+
+# ONNX runtime (CPU; swap for onnxruntime-gpu for GPU)
 onnxruntime
+
+# Hugging Face model download
 huggingface_hub
+
+# numpy (keep <2 for sherpa-onnx / k2 compatibility)
 numpy<2
+
+# sherpa-onnx — install the pre-built wheel for your platform from:
+# https://k2-fsa.github.io/sherpa/onnx/install/index.html
+# Example (CPU, Linux x86_64, Python 3.10):
+# pip install sherpa-onnx==1.12.35
+# or from the wheel in requirements_8_.txt
+sherpa-onnx
