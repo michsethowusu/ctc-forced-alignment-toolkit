@@ -1,0 +1,15 @@
+--find-links https://download.pytorch.org/whl/cpu
+--find-links https://huggingface.co/csukuangfj/k2/resolve/main/cpu/1.24.4.dev20250307/linux-x64
+--find-links https://huggingface.co/csukuangfj/sherpa/resolve/main/cpu/1.4.0.dev20250307/linux-x64
+--find-links https://huggingface.co/csukuangfj/kaldifeat/resolve/main/cpu/1.25.5.dev20250307/linux-x64
+--find-links https://huggingface.co/csukuangfj2/sherpa-onnx-wheels/resolve/main/cpu/1.12.35
+
+torch==1.13.1+cpu
+torchaudio==0.13.1+cpu
+k2==1.24.4.dev20250307+cpu.torch1.13.1
+k2_sherpa==1.4.0.dev20250307+cpu.torch1.13.1
+kaldifeat==1.25.5.dev20250307+cpu.torch1.13.1
+sherpa_onnx==1.12.35
+sentencepiece>=0.1.96
+numpy<2
+huggingface_hub

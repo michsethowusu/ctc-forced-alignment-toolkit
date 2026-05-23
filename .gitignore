@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+example/output/
+alignment.json
+alignment.srt
+*.wav
+*.mp3

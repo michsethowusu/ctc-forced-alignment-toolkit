@@ -1,0 +1,13 @@
+model:
+  repo: "csukuangfj2/sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-int8-2025-11-12"
+  model_file: "model.int8.onnx"
+  tokens_file: "tokens.txt"
+  blank_id: 0
+
+audio:
+  sample_rate: 16000
+
+alignment:
+  frame_period_auto: true   # auto-detect from emissions length
+  merge_words: true
+  output_srt: false
